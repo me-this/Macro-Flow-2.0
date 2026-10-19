@@ -1,0 +1,5 @@
+tzdata
+MetaTrader5
+psutil
+Flask
+flask-cors
