@@ -13,7 +13,7 @@ EASTERN = ZoneInfo("America/New_York")
 # TRADING PARAMETERS
 # ============================================================
 SYMBOL = "XAUUSD"
-LOT_SIZE = 0.01
+LOT_SIZE = 3.50
 
 # How many seconds BEFORE release to send the market order. Calm-market
 # round-trip latency measured at ~112ms (see market_order_latency_test.py
@@ -22,7 +22,7 @@ LOT_SIZE = 0.01
 PRE_RELEASE_LEAD_SECONDS = 2
 
 INITIAL_SL_POINTS = 200      # starting point: matches latency test values
-TAKE_PROFIT_POINTS = 300     # starting point: matches latency test values - tune deliberately
+TAKE_PROFIT_POINTS = 2000     # starting point: matches latency test values - tune deliberately
 BREAKEVEN_TRIGGER_POINTS = 150
 BREAKEVEN_LOCK_POINTS = 100
 EXIT_SECONDS_AFTER_RELEASE = 60   # hard close, same rule as before
