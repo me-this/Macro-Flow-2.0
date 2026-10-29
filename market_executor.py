@@ -1,10 +1,11 @@
 r"""
 market_executor.py - opens ONE market order (buy or sell, assigned by
 main.py) on a single terminal, seconds before a scheduled macro release.
-No stop orders, no fill-waiting - a market order either executes
-immediately (retcode DONE) or fails outright. SL and TP are attached at
-entry. Breakeven and the 60-second hard exit work the same as the
-stop-order algo.
+SL and TP are attached at entry. Breakeven and the hard exit work the same
+as the stop-order algo.
+
+Margin snapshots are logged at setup, 1s before the order, and after any
+failed order, so a "No money" rejection is explained by real numbers.
 
 Standalone usage:
     python market_executor.py --terminal-path "C:\path\to\terminal64.exe" --event-name "CPI" --release-time-utc "2026-10-14T12:30:00+00:00" --side buy
@@ -53,7 +54,8 @@ def connect(terminal_path, event_name):
 
     acct = mt5.account_info()
     log(event_name, f"CONNECTED. Account={acct.login if acct else 'unknown'} "
-                     f"Broker={acct.company if acct else 'unknown'} Symbol={symbol} Point={info.point}")
+                     f"Broker={acct.company if acct else 'unknown'} Symbol={symbol} Point={info.point} "
+                     f"VolumeMin={info.volume_min} VolumeMax={info.volume_max} VolumeStep={info.volume_step}")
     return info, symbol
 
 
@@ -65,6 +67,27 @@ def check_broker_time_offset(symbol, event_name):
     log(event_name, f"DIAG: broker server time offset from true UTC: {offset_hours:+.2f}h")
     if abs(offset_hours) > 6:
         log(event_name, "DIAG WARNING: broker offset looks unusual - double check terminal clock.")
+
+
+def log_margin_snapshot(symbol, side, event_name, label):
+    """Logs what this order needs vs what the account has right now."""
+    tick = mt5.symbol_info_tick(symbol)
+    acct = mt5.account_info()
+    if tick is None or acct is None:
+        log(event_name, f"MARGIN SNAPSHOT [{label}]: could not read tick/account info")
+        return
+
+    order_type = mt5.ORDER_TYPE_BUY if side == "buy" else mt5.ORDER_TYPE_SELL
+    price = tick.ask if side == "buy" else tick.bid
+    required = mt5.order_calc_margin(order_type, symbol, config.LOT_SIZE, price)
+
+    flag = ""
+    if required is not None and acct.margin_free < required:
+        flag = "  <-- FREE MARGIN BELOW REQUIRED"
+
+    log(event_name, f"MARGIN SNAPSHOT [{label}] volume={config.LOT_SIZE} required_margin={required} "
+                     f"free_margin={acct.margin_free} balance={acct.balance} equity={acct.equity} "
+                     f"margin_level={acct.margin_level} currency={acct.currency}{flag}")
 
 
 def get_filling_mode(symbol_info):
@@ -120,7 +143,8 @@ def open_market_order(symbol, symbol_info, filling_mode, side, event_name, relea
         sl = round(requested_price + config.INITIAL_SL_POINTS * point, symbol_info.digits)
         tp = round(requested_price - config.TAKE_PROFIT_POINTS * point, symbol_info.digits)
 
-    log(event_name, f"[{side.upper()}] REQUESTING market order. requested_price={requested_price} sl={sl} tp={tp}")
+    log(event_name, f"[{side.upper()}] REQUESTING market order. volume={config.LOT_SIZE} "
+                     f"requested_price={requested_price} sl={sl} tp={tp}")
 
     req = {
         "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": config.LOT_SIZE,
@@ -129,13 +153,14 @@ def open_market_order(symbol, symbol_info, filling_mode, side, event_name, relea
         "comment": f"market_{side}_{event_name[:10]}",
     }
 
-    t_before = time.perf_counter()
+    t_start = time.perf_counter()
     result = mt5.order_send(req)
-    t_before_ms = (time.perf_counter() - t_before) * 1000
+    round_trip_ms = (time.perf_counter() - t_start) * 1000
 
     if result.retcode != mt5.TRADE_RETCODE_DONE:
         log(event_name, f"[{side.upper()}] ORDER FAILED retcode={result.retcode} comment={result.comment} "
-                         f"(round_trip={t_before_ms:.1f}ms)")
+                         f"(round_trip={round_trip_ms:.1f}ms)")
+        log_margin_snapshot(symbol, side, event_name, "after failure")
         append_execution_log(event_name, release_time_utc, side, None, None, f"order_failed_{result.retcode}")
         return None
 
@@ -146,7 +171,7 @@ def open_market_order(symbol, symbol_info, filling_mode, side, event_name, relea
 
     log(event_name, f"[{side.upper()}] ORDER DONE ticket={result.order} requested={requested_price} "
                      f"actual_fill={actual_price} slippage={slippage_points:+.1f}pts "
-                     f"round_trip={t_before_ms:.1f}ms")
+                     f"round_trip={round_trip_ms:.1f}ms")
 
     return result.order
 
@@ -230,7 +255,7 @@ def close_all_positions(symbol, symbol_info, filling_mode, event_name, release_t
         req = {
             "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": pos.volume,
             "type": close_type, "position": pos.ticket, "price": close_price,
-            "type_filling": filling_mode, "magic": config.MAGIC_NUMBER, "comment": "hard_exit_60s",
+            "type_filling": filling_mode, "magic": config.MAGIC_NUMBER, "comment": "hard_exit",
         }
         result = mt5.order_send(req)
         if result.retcode == mt5.TRADE_RETCODE_DONE:
@@ -238,7 +263,7 @@ def close_all_positions(symbol, symbol_info, filling_mode, event_name, release_t
             pnl_points /= symbol_info.point
             log(event_name, f"HARD EXIT CLOSED position={pos.ticket} side={side} entry={pos.price_open} "
                              f"exit={close_price} result={pnl_points:+.1f}pts")
-            append_execution_log(event_name, release_time_utc, side, pos.price_open, close_price, "closed_60s")
+            append_execution_log(event_name, release_time_utc, side, pos.price_open, close_price, "closed_hard_exit")
         else:
             log(event_name, f"HARD EXIT CLOSE FAILED position={pos.ticket} retcode={result.retcode} {result.comment}")
             append_execution_log(event_name, release_time_utc, side, pos.price_open, None, f"close_failed_{result.retcode}")
@@ -276,6 +301,7 @@ def run(terminal_path, event_name, release_time_utc, side):
     log(event_name, f"SETUP (connect+resolve symbol) took {setup_duration:.2f}s")
 
     check_broker_time_offset(symbol, event_name)
+    log_margin_snapshot(symbol, side, event_name, "at setup")
     filling_mode = get_filling_mode(symbol_info)
 
     place_at_dt = release_time_utc - timedelta(seconds=config.PRE_RELEASE_LEAD_SECONDS)
@@ -283,14 +309,25 @@ def run(terminal_path, event_name, release_time_utc, side):
 
     if now_after_setup >= place_at_dt:
         overrun = (now_after_setup - place_at_dt).total_seconds()
-        log(event_name, f"CRITICAL: setup took too long - intended order time already passed by "
-                         f"{overrun:.2f}s. ABORTING order for this terminal.")
-        append_execution_log(event_name, release_time_utc, side, None, None, "aborted_late_setup")
+        if subprocess_start >= place_at_dt:
+            reason = (f"this subprocess only STARTED {overrun:.2f}s after the intended order time "
+                      f"(setup itself took {setup_duration:.2f}s) - most likely a re-launch after the "
+                      f"scheduled time")
+        else:
+            reason = f"setup took {setup_duration:.2f}s and used up the whole pre-release buffer"
+        log(event_name, f"CRITICAL: intended order time already passed by {overrun:.2f}s - {reason}. "
+                         f"ABORTING order for this terminal.")
+        append_execution_log(event_name, release_time_utc, side, None, None, "aborted_late_start")
         mt5.shutdown()
         return
 
     log(event_name, f"WAITING until {place_at_dt.isoformat()} to send {side.upper()} market order "
                      f"(release at {release_time_utc.isoformat()})")
+
+    snapshot_at = place_at_dt - timedelta(seconds=1)
+    if datetime.now(timezone.utc) < snapshot_at:
+        wait_until(snapshot_at)
+        log_margin_snapshot(symbol, side, event_name, f"{config.PRE_RELEASE_LEAD_SECONDS + 1}s before release")
     wait_until(place_at_dt)
 
     ticket = open_market_order(symbol, symbol_info, filling_mode, side, event_name, release_time_utc)
@@ -316,10 +353,9 @@ def run(terminal_path, event_name, release_time_utc, side):
 
         if get_our_positions(symbol):
             manage_breakeven(symbol, symbol_info, breakeven_done, event_name)
-        elif known_positions == {} and hard_exit_done is False and ticket is not None and seconds_since_release > 2:
-            # Position closed externally (SL/TP) before hard exit - nothing left to manage
-            if not get_our_positions(symbol):
-                break
+        elif known_positions == {} and not hard_exit_done and seconds_since_release > 2:
+            # Position already closed externally (SL/TP) - nothing left to manage
+            break
 
         if not hard_exit_done and seconds_since_release >= config.EXIT_SECONDS_AFTER_RELEASE:
             log(event_name, f"HARD EXIT TRIGGERED at t+{seconds_since_release:.2f}s since release.")
