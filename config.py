@@ -13,7 +13,7 @@ EASTERN = ZoneInfo("America/New_York")
 # TRADING PARAMETERS
 # ============================================================
 SYMBOL = "XAUUSD"
-LOT_SIZE = 3.50
+LOT_SIZE = 0.5
 
 # How many seconds BEFORE release to send the market order. Calm-market
 # round-trip latency measured at ~112ms (see market_order_latency_test.py
